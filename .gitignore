@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pth
+*.mat
+checkpoints/
+results/
+logs/
+*.log
+.DS_Store
+data/
+DroneRFa/
+*.rar
+*.zip
