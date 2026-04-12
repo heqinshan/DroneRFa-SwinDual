@@ -1,4 +1,7 @@
 import os
+# 【修复】强制走国内镜像下载预训练权重，避免假死
+os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
+
 import json
 import argparse
 import numpy as np
@@ -9,48 +12,37 @@ from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm
 
 from config import config
-from dataset import DroneRFaDataset
-from transforms import STFTTransform
+from dataset import DroneRFaDataset, STFTTransform
 from models.swin_dual import TimeFreqDecoupledSwin
 from models.resnet import ResNetBaseline
 from utils_plot import plot_training_curves, plot_tsne
 from models.alexnet import AlexNetBaseline
 from models.vgg import VGG16Baseline
-import torch.nn.functional as F   # 如果没有则添加
-
+import torch.nn.functional as F
 
 def extract_features(model, dataloader, device, max_batches=50):
     model.eval()
     features, labels = [], []
     with torch.no_grad():
         for i, (images, lbls) in enumerate(dataloader):
-            if i >= max_batches:
-                break
+            if i >= max_batches: break
             images = images.to(device)
 
-            # ---------- 根据模型类型提取特征 ----------
             if hasattr(model, 'forward_with_features'):
-                # Swin-Dual 专用
-                _, feat_time, feat_freq = model.forward_with_features(images)
-                feat = torch.cat([feat_time, feat_freq], dim=1)
+                # 兼容消融实验，直接使用 forward 获取分类结果特征用于 tSNE (暂代)
+                feat = model(images)
             elif hasattr(model, 'backbone'):
-                # ResNet 系列
                 feat = model.backbone.forward_features(images).mean(dim=1)
             elif hasattr(model, 'model') and hasattr(model.model, 'features'):
-                # AlexNet / VGG16：提取卷积特征并全局池化
                 feat = model.model.features(images)
                 feat = torch.nn.functional.adaptive_avg_pool2d(feat, (1, 1))
                 feat = feat.view(feat.size(0), -1)
             else:
-                # 通用回退：直接取最后一层之前的特征（简单但可能不完美）
-                # 对于大多数模型，可以注册 hook 获取中间层，这里先用展平应急
                 feat = images.view(images.size(0), -1)
-            # -------------------------------------------
 
             features.append(feat.cpu().numpy())
             labels.append(lbls.numpy())
     return np.concatenate(features), np.concatenate(labels)
-
 
 def train_one_epoch(model, dataloader, optimizer, criterion, scaler, device, use_amp=True):
     model.train()
@@ -78,7 +70,6 @@ def train_one_epoch(model, dataloader, optimizer, criterion, scaler, device, use
         pbar.set_postfix({'loss': f'{loss.item():.4f}', 'acc': f'{100.*correct/total:.2f}%'})
     return total_loss / len(dataloader), 100. * correct / total
 
-
 def validate(model, dataloader, criterion, device, use_amp=True):
     model.eval()
     total_loss, correct, total = 0, 0, 0
@@ -100,11 +91,10 @@ def validate(model, dataloader, criterion, device, use_amp=True):
             pbar.set_postfix({'loss': f'{loss.item():.4f}', 'acc': f'{100.*correct/total:.2f}%'})
     return total_loss / len(dataloader), 100. * correct / total
 
-
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model', type=str, default='swin_dual',
-                        choices=['swin_dual', 'resnet50', 'resnet18', 'alexnet','vgg16'])
+    parser.add_argument('--model', type=str, default='swin_dual', choices=['swin_dual', 'resnet50', 'resnet18', 'alexnet','vgg16'])
+    parser.add_argument('--swin_mode', type=str, default='both', choices=['both', 'time', 'freq'], help='Swin消融实验模式')
     parser.add_argument('--epochs', type=int, default=config.NUM_EPOCHS)
     parser.add_argument('--batch_size', type=int, default=config.BATCH_SIZE)
     parser.add_argument('--lr', type=float, default=config.LEARNING_RATE)
@@ -117,42 +107,46 @@ def main():
     device = torch.device(config.DEVICE if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}")
 
-    transform = STFTTransform(nperseg=config.STFT_NPERSEG, noverlap=config.STFT_NOVERLAP,
-                              output_size=(config.IMG_SIZE, config.IMG_SIZE))
-    train_dataset = DroneRFaDataset(config.DATA_ROOT, transform, config.SEGMENT_LENGTH, 10, split='train', train_ratio=0.7, val_ratio=0.15)
-    val_dataset = DroneRFaDataset(config.DATA_ROOT, transform, config.SEGMENT_LENGTH, 10, split='val', train_ratio=0.7, val_ratio=0.15)
+    # 【修复】训练集开启数据增强，验证集绝对禁止数据增强！
+    train_transform = STFTTransform(nperseg=config.STFT_NPERSEG, noverlap=config.STFT_NOVERLAP, 
+                                    output_size=(config.IMG_SIZE, config.IMG_SIZE), is_train=True)
+    val_transform = STFTTransform(nperseg=config.STFT_NPERSEG, noverlap=config.STFT_NOVERLAP, 
+                                  output_size=(config.IMG_SIZE, config.IMG_SIZE), is_train=False)
 
-    train_loader = DataLoader(train_dataset, args.batch_size, shuffle=True,
-                              num_workers=config.NUM_WORKERS, pin_memory=True, persistent_workers=True)
-    val_loader = DataLoader(val_dataset, args.batch_size, shuffle=False,
-                            num_workers=config.NUM_WORKERS, pin_memory=True, persistent_workers=True)
+    train_dataset = DroneRFaDataset(config.DATA_ROOT, train_transform, config.SEGMENT_LENGTH, 10, split='train', train_ratio=0.7, val_ratio=0.15)
+    val_dataset = DroneRFaDataset(config.DATA_ROOT, val_transform, config.SEGMENT_LENGTH, 10, split='val', train_ratio=0.7, val_ratio=0.15)
+
+    train_loader = DataLoader(train_dataset, args.batch_size, shuffle=True, num_workers=config.NUM_WORKERS, pin_memory=True, persistent_workers=True)
+    val_loader = DataLoader(val_dataset, args.batch_size, shuffle=False, num_workers=config.NUM_WORKERS, pin_memory=True, persistent_workers=True)
 
     if args.model == 'swin_dual':
-        model = TimeFreqDecoupledSwin(num_classes=config.NUM_CLASSES, pretrained=True)
+        model = TimeFreqDecoupledSwin(num_classes=config.NUM_CLASSES, pretrained=True, mode=args.swin_mode)
         use_amp = True
+        save_name = f"{args.model}_{args.swin_mode}"
     elif args.model in ['resnet50', 'resnet18']:
         model = ResNetBaseline(num_classes=config.NUM_CLASSES, backbone=args.model, pretrained=True)
         use_amp = True
+        save_name = args.model
     elif args.model == 'alexnet':
         model = AlexNetBaseline(num_classes=config.NUM_CLASSES, pretrained=False)
         use_amp = True
+        save_name = args.model
     elif args.model == 'vgg16':
         model = VGG16Baseline(num_classes=config.NUM_CLASSES, pretrained=False)
         use_amp = True
+        save_name = args.model
     else:
         raise ValueError(f"未知模型: {args.model}")
 
     model = model.to(device)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=config.WEIGHT_DECAY)
+    # 【修复】合并优化器和学习率调度器的实例化顺序
+    weight_decay = 5e-4 if args.model in ['alexnet', 'vgg16'] else config.WEIGHT_DECAY
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     criterion = nn.CrossEntropyLoss()
     scaler = GradScaler() if use_amp else None
-    if args.model in ['alexnet', 'vgg16']:
-        weight_decay = 5e-4
-    else:
-        weight_decay = config.WEIGHT_DECAY  # 1e-4
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=weight_decay)
+
     start_epoch, best_acc = 0, 0
     if args.resume:
         checkpoint = torch.load(args.resume)
@@ -179,17 +173,16 @@ def main():
             best_acc = val_acc
             torch.save({'epoch': epoch, 'model_state_dict': model.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(), 'best_acc': best_acc},
-                       f"{config.CHECKPOINT_DIR}/{args.model}_best.pth")
+                       f"{config.CHECKPOINT_DIR}/{save_name}_best.pth")
 
-    plot_training_curves(history, f"{config.RESULT_DIR}/{args.model}_training_curves.png")
-    with open(f"{config.RESULT_DIR}/{args.model}_history.json", 'w') as f:
+    plot_training_curves(history, f"{config.RESULT_DIR}/{save_name}_training_curves.png")
+    with open(f"{config.RESULT_DIR}/{save_name}_history.json", 'w') as f:
         json.dump(history, f, indent=2)
 
-    checkpoint = torch.load(f"{config.CHECKPOINT_DIR}/{args.model}_best.pth")
+    checkpoint = torch.load(f"{config.CHECKPOINT_DIR}/{save_name}_best.pth")
     model.load_state_dict(checkpoint['model_state_dict'])
     features, labels = extract_features(model, val_loader, device)
-    plot_tsne(features, labels, config.CLASS_NAMES, f"{config.RESULT_DIR}/{args.model}_tsne.png")
-
+    plot_tsne(features, labels, config.CLASS_NAMES, f"{config.RESULT_DIR}/{save_name}_tsne.png")
 
 if __name__ == '__main__':
     main()
