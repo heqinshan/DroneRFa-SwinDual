@@ -5,10 +5,24 @@ import scipy.signal
 import cv2
 from tqdm import tqdm
 from multiprocessing import Pool
-from dataset import parse_filename
+
 
 # 【新增】引入你项目里的配置文件
 from config import config
+def parse_filename(filepath):
+    import os
+    basename = os.path.basename(filepath).replace('.mat', '')
+    t_code = basename.split('_')[0]
+    mapping = {
+        "T0000": 0, "T0001": 1, "T0010": 2, "T0011": 3,
+        "T0100": 4, "T0101": 5, "T0110": 6, "T0111": 7,
+        "T1000": 8, "T1001": 9, "T1010": 10, "T1011": 11,
+        "T1100": 12, "T1101": 13, "T1110": 14, "T1111": 15,
+        "T10000": 16, "T10001": 17, "T10010": 18, "T10011": 19,
+        "T10100": 20, "T10101": 21, "T10110": 22, "T10111": 23,
+        "T11000": 24
+    }
+    return mapping.get(t_code, 0)
 
 # 【修改】直接使用 config 里的绝对路径，再也不会找不到文件了！
 DATA_ROOT = config.DATA_ROOT         

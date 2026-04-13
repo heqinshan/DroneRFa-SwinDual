@@ -3,7 +3,7 @@ import argparse
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader
 from sklearn.metrics import accuracy_score
 import numpy as np
@@ -80,9 +80,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', type=str, default='swin_dual')
     parser.add_argument('--swin_mode', type=str, default='both')
-    parser.add_argument('--epochs', type=int, default=20) # 【修改】默认只跑20轮足够了
+    parser.add_argument('--epochs', type=int, default=30) # 【设定】：默认直接跑 30 轮
     parser.add_argument('--batch_size', type=int, default=512) 
-    parser.add_argument('--lr', type=float, default=2e-4) # 配合余弦退火略微提高初始LR
+    parser.add_argument('--lr', type=float, default=3e-4) # 【设定】：配合 Warmup 提高初始峰值学习率
     args = parser.parse_args()
 
     CHECKPOINT_DIR = os.path.abspath(config.CHECKPOINT_DIR if hasattr(config, 'CHECKPOINT_DIR') else './checkpoints')
@@ -92,11 +92,14 @@ def main():
     print(f"Device: {device} | AMP: True | Checkpoint Dir: {CHECKPOINT_DIR}")
 
     # ==========================================
-    # 数据增强：随机擦除抗过拟合
+    # 数据增强：针对 STFT 频谱图的抗过拟合设计
     # ==========================================
     train_transform = T.Compose([
         T.ToTensor(),
-        T.RandomErasing(p=0.5, scale=(0.02, 0.1), ratio=(0.3, 3.3), value=0), 
+        # 防止模型死记硬背跳频信号的绝对时间位置
+        T.RandomAffine(degrees=0, translate=(0.05, 0.05)), 
+        # value='random' 填充随机噪声，物理上等效于恶劣信道中的宽带干扰
+        T.RandomErasing(p=0.5, scale=(0.02, 0.1), ratio=(0.3, 3.3), value='random'), 
     ])
     
     val_transform = T.Compose([
@@ -111,12 +114,12 @@ def main():
     train_loader = DataLoader(
         train_dataset, args.batch_size, shuffle=True, 
         num_workers=16, pin_memory=True, persistent_workers=True, prefetch_factor=4, 
-        drop_last=True  # <-- 加上这个护身符！
+        drop_last=True 
     )
     val_loader = DataLoader(
         val_dataset, args.batch_size, shuffle=False, 
         num_workers=16, pin_memory=True, persistent_workers=True, prefetch_factor=4, 
-        drop_last=True  # <-- 加上这个护身符！
+        drop_last=True 
     )
 
     if args.model == 'swin_dual':
@@ -133,11 +136,27 @@ def main():
         model = torch.compile(model)
 
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.05) # 强权重衰减
-    scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6) # 余弦学习率
+    
+    # 强化 Weight Decay，从 0.05 提升至 0.1 压制过拟合
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.1) 
+    
+    # ==========================================
+    # Transformer 必备的 Warmup 调度器
+    # ==========================================
+    warmup_epochs = 5
+    # 前 5 轮从极小学习率缓慢爬升至目标 args.lr
+    warmup_scheduler = LinearLR(optimizer, start_factor=0.01, total_iters=warmup_epochs)
+    # 5 轮后接管，进行余弦退火
+    cosine_scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs - warmup_epochs, eta_min=1e-6)
+    # 将两者组合
+    scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warmup_epochs])
     
     scaler = GradScaler()
     best_acc = 0.0
+    
+    # 早停机制参数
+    patience = 12
+    patience_counter = 0
 
     print("\n🚀 训练正式开始！(支持 Ctrl+C 安全紧急中断)")
     print("="*60)
@@ -151,10 +170,11 @@ def main():
             scheduler.step()
             current_lr = optimizer.param_groups[0]['lr']
             
-            print(f"Epoch {epoch}/{args.epochs} | LR: {current_lr:.2e} | Train Acc: {(train_acc*100):.2f}% | Val Acc: {(val_acc*100):.2f}%")
+            print(f"Epoch {epoch+1}/{args.epochs} | LR: {current_lr:.2e} | Train Acc: {(train_acc*100):.2f}% | Val Acc: {(val_acc*100):.2f}%")
             
             if val_acc > best_acc:
                 best_acc = val_acc
+                patience_counter = 0 # 重置早停计数器
                 best_path = os.path.join(CHECKPOINT_DIR, f"{save_name}_best.pth")
                 torch.save({
                     'epoch': epoch,
@@ -163,6 +183,11 @@ def main():
                     'val_acc': val_acc
                 }, best_path)
                 print(f"🌟 [新突破] 最优模型已更新并保存至: {best_path}")
+            else:
+                patience_counter += 1
+                if patience_counter >= patience:
+                    print(f"\n🛑 触发早停！连续 {patience} 轮验证集无提升，训练提前结束。最优验证集精度: {(best_acc*100):.2f}%")
+                    break
                 
     except KeyboardInterrupt:
         print("\n\n⚠️ 收到中止指令 (Ctrl + C)！正在紧急打包当前模型...")

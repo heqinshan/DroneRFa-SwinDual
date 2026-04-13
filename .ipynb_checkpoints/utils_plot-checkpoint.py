@@ -4,6 +4,7 @@ import seaborn as sns
 from sklearn.manifold import TSNE
 from sklearn.metrics import roc_curve, auc, precision_recall_curve
 import torch
+import torch.nn.functional as F
 import cv2
 
 # 设置统一的学术风格
@@ -74,7 +75,7 @@ def plot_per_class_f1(f1_scores, class_names, save_path):
     sorted_f1 = [f1_scores[i] for i in sorted_idx]
     
     plt.figure(figsize=(14, 6))
-    bars = plt.bar(range(len(sorted_f1)), sorted_f1, color=COLORS)
+    plt.bar(range(len(sorted_f1)), sorted_f1, color=COLORS)
     plt.xticks(range(len(sorted_f1)), sorted_names, rotation=90)
     plt.ylabel('F1-Score')
     plt.xlabel('Class')
@@ -163,67 +164,72 @@ def plot_gradcam(model, image_tensor, target_layer, class_idx=None, save_path=No
     适用于 Swin-Transformer 的特定层
     """
     model.eval()
+    # 确保输入张量需要梯度
     image_tensor = image_tensor.unsqueeze(0).cuda()
     image_tensor.requires_grad = True
-    
-    # 注册 hook 捕获特征图和梯度
+
     features = []
     gradients = []
-    
+
     def forward_hook(module, input, output):
         features.append(output)
-    
+
     def backward_hook(module, grad_in, grad_out):
         gradients.append(grad_out[0])
-    
+
     handle_forward = target_layer.register_forward_hook(forward_hook)
     handle_backward = target_layer.register_full_backward_hook(backward_hook)
-    
+
     output = model(image_tensor)
     if class_idx is None:
         class_idx = output.argmax().item()
-    
+
     model.zero_grad()
     output[0, class_idx].backward()
-    
-    # 计算 Grad-CAM
-    feature_map = features[0].detach()  # (1, C, H, W) or (1, L, D)
+
+    feature_map = features[0].detach()
     grad = gradients[0].detach()
-    
-    # 对于 Swin Transformer，特征图可能是序列形式，需要重塑
+
+    # 处理 Swin Transformer 的序列输出
     if len(feature_map.shape) == 3:  # (1, L, D)
-        # 重塑为 2D 特征图（假设 L 可开方）
         L = feature_map.shape[1]
         H = W = int(np.sqrt(L))
         feature_map = feature_map.view(1, H, W, -1).permute(0, 3, 1, 2)
         grad = grad.view(1, H, W, -1).permute(0, 3, 1, 2)
-    
+
     weights = grad.mean(dim=(2, 3), keepdim=True)
     cam = (weights * feature_map).sum(dim=1, keepdim=True)
     cam = torch.relu(cam)
     cam = cam - cam.min()
     cam = cam / (cam.max() + 1e-8)
-    
-    # 上采样到原始图像大小
-    cam = torch.nn.functional.interpolate(cam, size=(224, 224), mode='bilinear')
+
+    cam = F.interpolate(cam, size=(224, 224), mode='bilinear')
     cam = cam.squeeze().cpu().numpy()
-    
-    # 叠加到原图
-    img = image_tensor.squeeze().cpu().numpy()
-    if img.shape[0] == 1:
-        img = np.stack([img[0]]*3, axis=-1)
+
+    # ---------- 修复图像形状处理 ----------
+    img = image_tensor.detach().squeeze().cpu().numpy()
+    if img.ndim == 2:  # (H, W)
+        img = np.stack([img]*3, axis=-1)
+    elif img.ndim == 3:
+        if img.shape[0] == 1:  # (1, H, W)
+            img = np.stack([img[0]]*3, axis=-1)
+        elif img.shape[0] == 3:  # (3, H, W)
+            img = img.transpose(1, 2, 0)
+        else:
+            img = img.transpose(1, 2, 0)  # fallback
     else:
-        img = img.transpose(1, 2, 0)
-    img = (img - img.min()) / (img.max() - img.min())
-    
+        raise ValueError(f"Unexpected image shape: {img.shape}")
+
+    img = (img - img.min()) / (img.max() - img.min() + 1e-8)
+
     cam_heatmap = cv2.applyColorMap(np.uint8(255 * cam), cv2.COLORMAP_JET)
     cam_heatmap = cv2.cvtColor(cam_heatmap, cv2.COLOR_BGR2RGB)
     overlay = 0.5 * img * 255 + 0.5 * cam_heatmap
     overlay = overlay.astype(np.uint8)
-    
+
     if save_path:
         plt.imsave(save_path, overlay)
-    
+
     handle_forward.remove()
     handle_backward.remove()
     return overlay
@@ -232,7 +238,7 @@ def plot_gradcam(model, image_tensor, target_layer, class_idx=None, save_path=No
 def plot_model_comparison(results_dict, save_path):
     """模型性能对比柱状图（准确率、F1、推理时间等）"""
     models = list(results_dict.keys())
-    metrics = ['Accuracy', 'Macro F1', 'Weighted F1']
+    metrics = ['accuracy', 'macro_f1', 'weighted_f1']
     
     x = np.arange(len(models))
     width = 0.25
@@ -241,7 +247,6 @@ def plot_model_comparison(results_dict, save_path):
     for i, metric in enumerate(metrics):
         values = [results_dict[m][metric] for m in models]
         bars = ax.bar(x + i*width, values, width, label=metric)
-        # 添加数值标签
         for bar in bars:
             height = bar.get_height()
             ax.annotate(f'{height:.3f}',
