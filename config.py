@@ -3,6 +3,7 @@ import os
 class Config:
     # 数据路径
     DATA_ROOT = "/root/autodl-tmp/DroneRFa"
+    IMAGE_DATA_ROOT = '/root/autodl-tmp/DroneRFa_Images'
     
     # 模型参数
     NUM_CLASSES = 25  # 修正：1类背景 + 24类无人机
@@ -15,13 +16,13 @@ class Config:
     STFT_NOVERLAP = 128
     
     # 训练参数
-    BATCH_SIZE = 32
+    BATCH_SIZE = 256
     NUM_EPOCHS = 100
     LEARNING_RATE = 1e-4
     WEIGHT_DECAY = 1e-4
     
     # 系统参数
-    NUM_WORKERS = 4
+    NUM_WORKERS = 20
     DEVICE = "cuda"
     
     # 路径

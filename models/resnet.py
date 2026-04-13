@@ -10,7 +10,9 @@ class ResNetBaseline(nn.Module):
             backbone,
             pretrained=pretrained,
             num_classes=num_classes,
-            in_chans=1  # 【修复】必须指定为单通道，适配 STFT 灰度图
+            in_chans=1,
+            drop_rate=0.5,        # 【新增】加入 50% 的全局 Dropout 防止过拟合
+            drop_path_rate=0.2    # 【新增】随机深度 (Stochastic Depth) 进一步正则化
         )
     
     def forward(self, x):

@@ -1,188 +1,180 @@
 import os
-# 【修复】强制走国内镜像下载预训练权重，避免假死
-os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
-
-import json
 import argparse
-import numpy as np
 import torch
 import torch.nn as nn
+import torch.optim as optim
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
-from torch.cuda.amp import GradScaler, autocast
+from sklearn.metrics import accuracy_score
+import numpy as np
 from tqdm import tqdm
+import torchvision.transforms as T
+
+# 引入自动混合精度 (AMP) 提速省显存
+from torch.cuda.amp import GradScaler, autocast
 
 from config import config
-from dataset import DroneRFaDataset, STFTTransform
+from dataset import DroneRFaImageDataset
 from models.swin_dual import TimeFreqDecoupledSwin
-from models.resnet import ResNetBaseline
-from utils_plot import plot_training_curves, plot_tsne
-from models.alexnet import AlexNetBaseline
-from models.vgg import VGG16Baseline
-import torch.nn.functional as F
 
-def extract_features(model, dataloader, device, max_batches=50):
-    model.eval()
-    features, labels = [], []
-    with torch.no_grad():
-        for i, (images, lbls) in enumerate(dataloader):
-            if i >= max_batches: break
-            images = images.to(device)
+# ==========================================
+# 极致性能压榨开关 (PyTorch 黑魔法)
+# ==========================================
+torch.backends.cudnn.benchmark = True
+torch.backends.cudnn.deterministic = False
 
-            if hasattr(model, 'forward_with_features'):
-                # 兼容消融实验，直接使用 forward 获取分类结果特征用于 tSNE (暂代)
-                feat = model(images)
-            elif hasattr(model, 'backbone'):
-                feat = model.backbone.forward_features(images).mean(dim=1)
-            elif hasattr(model, 'model') and hasattr(model.model, 'features'):
-                feat = model.model.features(images)
-                feat = torch.nn.functional.adaptive_avg_pool2d(feat, (1, 1))
-                feat = feat.view(feat.size(0), -1)
-            else:
-                feat = images.view(images.size(0), -1)
-
-            features.append(feat.cpu().numpy())
-            labels.append(lbls.numpy())
-    return np.concatenate(features), np.concatenate(labels)
-
-def train_one_epoch(model, dataloader, optimizer, criterion, scaler, device, use_amp=True):
+def train_one_epoch(model, dataloader, optimizer, criterion, scaler, device):
     model.train()
-    total_loss, correct, total = 0, 0, 0
-    pbar = tqdm(dataloader, desc="Train")
+    running_loss = 0.0
+    all_preds, all_labels = [], []
+    
+    pbar = tqdm(dataloader, desc="Train", leave=False)
     for images, labels in pbar:
-        images, labels = images.to(device), labels.to(device)
-        optimizer.zero_grad()
-        if use_amp:
-            with autocast():
-                outputs = model(images)
-                loss = criterion(outputs, labels)
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-        else:
+        # non_blocking=True 允许数据搬运和计算异步重叠
+        images, labels = images.to(device, non_blocking=True), labels.to(device, non_blocking=True)
+        
+        optimizer.zero_grad(set_to_none=True) # 减少显存碎片
+        
+        with autocast():
             outputs = model(images)
             loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
-        total_loss += loss.item()
-        _, predicted = outputs.max(1)
-        total += labels.size(0)
-        correct += predicted.eq(labels).sum().item()
-        pbar.set_postfix({'loss': f'{loss.item():.4f}', 'acc': f'{100.*correct/total:.2f}%'})
-    return total_loss / len(dataloader), 100. * correct / total
+            
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
 
-def validate(model, dataloader, criterion, device, use_amp=True):
+        running_loss += loss.item() * images.size(0)
+        _, preds = torch.max(outputs, 1)
+        all_preds.extend(preds.cpu().numpy())
+        all_labels.extend(labels.cpu().numpy())
+        
+        pbar.set_postfix({'loss': f"{loss.item():.4f}", 'acc': f"{(accuracy_score(all_labels, all_preds)*100):.2f}%"})
+
+    epoch_loss = running_loss / len(dataloader.dataset)
+    epoch_acc = accuracy_score(all_labels, all_preds)
+    return epoch_loss, epoch_acc
+
+def validate(model, dataloader, criterion, device):
     model.eval()
-    total_loss, correct, total = 0, 0, 0
+    running_loss = 0.0
+    all_preds, all_labels = [], []
+    
     with torch.no_grad():
-        pbar = tqdm(dataloader, desc="Val")
-        for images, labels in pbar:
-            images, labels = images.to(device), labels.to(device)
-            if use_amp:
-                with autocast():
-                    outputs = model(images)
-                    loss = criterion(outputs, labels)
-            else:
+        for images, labels in tqdm(dataloader, desc="Val", leave=False):
+            images, labels = images.to(device, non_blocking=True), labels.to(device, non_blocking=True)
+            
+            with autocast(): 
                 outputs = model(images)
                 loss = criterion(outputs, labels)
-            total_loss += loss.item()
-            _, predicted = outputs.max(1)
-            total += labels.size(0)
-            correct += predicted.eq(labels).sum().item()
-            pbar.set_postfix({'loss': f'{loss.item():.4f}', 'acc': f'{100.*correct/total:.2f}%'})
-    return total_loss / len(dataloader), 100. * correct / total
+                
+            running_loss += loss.item() * images.size(0)
+            _, preds = torch.max(outputs, 1)
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+
+    epoch_loss = running_loss / len(dataloader.dataset)
+    epoch_acc = accuracy_score(all_labels, all_preds)
+    return epoch_loss, epoch_acc
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model', type=str, default='swin_dual', choices=['swin_dual', 'resnet50', 'resnet18', 'alexnet','vgg16'])
-    parser.add_argument('--swin_mode', type=str, default='both', choices=['both', 'time', 'freq'], help='Swin消融实验模式')
-    parser.add_argument('--epochs', type=int, default=config.NUM_EPOCHS)
-    parser.add_argument('--batch_size', type=int, default=config.BATCH_SIZE)
-    parser.add_argument('--lr', type=float, default=config.LEARNING_RATE)
-    parser.add_argument('--resume', type=str, default=None)
+    parser.add_argument('--model', type=str, default='swin_dual')
+    parser.add_argument('--swin_mode', type=str, default='both')
+    parser.add_argument('--epochs', type=int, default=20) # 【修改】默认只跑20轮足够了
+    parser.add_argument('--batch_size', type=int, default=512) 
+    parser.add_argument('--lr', type=float, default=2e-4) # 配合余弦退火略微提高初始LR
     args = parser.parse_args()
 
-    os.makedirs(config.CHECKPOINT_DIR, exist_ok=True)
-    os.makedirs(config.RESULT_DIR, exist_ok=True)
+    CHECKPOINT_DIR = os.path.abspath(config.CHECKPOINT_DIR if hasattr(config, 'CHECKPOINT_DIR') else './checkpoints')
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    print(f"Device: {device} | AMP: True | Checkpoint Dir: {CHECKPOINT_DIR}")
 
-    device = torch.device(config.DEVICE if torch.cuda.is_available() else 'cpu')
-    print(f"Device: {device}")
+    # ==========================================
+    # 数据增强：随机擦除抗过拟合
+    # ==========================================
+    train_transform = T.Compose([
+        T.ToTensor(),
+        T.RandomErasing(p=0.5, scale=(0.02, 0.1), ratio=(0.3, 3.3), value=0), 
+    ])
+    
+    val_transform = T.Compose([
+        T.ToTensor()
+    ])
 
-    # 【修复】训练集开启数据增强，验证集绝对禁止数据增强！
-    train_transform = STFTTransform(nperseg=config.STFT_NPERSEG, noverlap=config.STFT_NOVERLAP, 
-                                    output_size=(config.IMG_SIZE, config.IMG_SIZE), is_train=True)
-    val_transform = STFTTransform(nperseg=config.STFT_NPERSEG, noverlap=config.STFT_NOVERLAP, 
-                                  output_size=(config.IMG_SIZE, config.IMG_SIZE), is_train=False)
+    print("正在加载极速图片数据集...")
+    train_dataset = DroneRFaImageDataset(config.IMAGE_DATA_ROOT, split='train', transform=train_transform)
+    val_dataset = DroneRFaImageDataset(config.IMAGE_DATA_ROOT, split='val', transform=val_transform)
 
-    train_dataset = DroneRFaDataset(config.DATA_ROOT, train_transform, config.SEGMENT_LENGTH, 10, split='train', train_ratio=0.7, val_ratio=0.15)
-    val_dataset = DroneRFaDataset(config.DATA_ROOT, val_transform, config.SEGMENT_LENGTH, 10, split='val', train_ratio=0.7, val_ratio=0.15)
-
-    train_loader = DataLoader(train_dataset, args.batch_size, shuffle=True, num_workers=config.NUM_WORKERS, pin_memory=True, persistent_workers=True)
-    val_loader = DataLoader(val_dataset, args.batch_size, shuffle=False, num_workers=config.NUM_WORKERS, pin_memory=True, persistent_workers=True)
+    # Dataloader 极致优化参数
+    train_loader = DataLoader(
+        train_dataset, args.batch_size, shuffle=True, 
+        num_workers=16, pin_memory=True, persistent_workers=True, prefetch_factor=4, 
+        drop_last=True  # <-- 加上这个护身符！
+    )
+    val_loader = DataLoader(
+        val_dataset, args.batch_size, shuffle=False, 
+        num_workers=16, pin_memory=True, persistent_workers=True, prefetch_factor=4, 
+        drop_last=True  # <-- 加上这个护身符！
+    )
 
     if args.model == 'swin_dual':
-        model = TimeFreqDecoupledSwin(num_classes=config.NUM_CLASSES, pretrained=True, mode=args.swin_mode)
-        use_amp = True
+        model = TimeFreqDecoupledSwin(num_classes=25, pretrained=True, mode=args.swin_mode)
         save_name = f"{args.model}_{args.swin_mode}"
-    elif args.model in ['resnet50', 'resnet18']:
-        model = ResNetBaseline(num_classes=config.NUM_CLASSES, backbone=args.model, pretrained=True)
-        use_amp = True
-        save_name = args.model
-    elif args.model == 'alexnet':
-        model = AlexNetBaseline(num_classes=config.NUM_CLASSES, pretrained=False)
-        use_amp = True
-        save_name = args.model
-    elif args.model == 'vgg16':
-        model = VGG16Baseline(num_classes=config.NUM_CLASSES, pretrained=False)
-        use_amp = True
-        save_name = args.model
-    else:
-        raise ValueError(f"未知模型: {args.model}")
-
     model = model.to(device)
 
-    # 【修复】合并优化器和学习率调度器的实例化顺序
-    weight_decay = 5e-4 if args.model in ['alexnet', 'vgg16'] else config.WEIGHT_DECAY
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=weight_decay)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    # ==========================================
+    # 核武器级优化：PyTorch 2.0 编译加速
+    # ==========================================
+    if hasattr(torch, 'compile'):
+        print("🚀 检测到 PyTorch 2.0+，正在启用底层计算图编译加速 (torch.compile)...")
+        # 注意：使用 compile 后，第一个 Epoch 的启动会卡住 1-2 分钟进行编译，耐心等待！
+        model = torch.compile(model)
+
     criterion = nn.CrossEntropyLoss()
-    scaler = GradScaler() if use_amp else None
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.05) # 强权重衰减
+    scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6) # 余弦学习率
+    
+    scaler = GradScaler()
+    best_acc = 0.0
 
-    start_epoch, best_acc = 0, 0
-    if args.resume:
-        checkpoint = torch.load(args.resume)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        start_epoch = checkpoint['epoch'] + 1
-        best_acc = checkpoint.get('best_acc', 0)
-
-    history = {'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': []}
-
-    for epoch in range(start_epoch, args.epochs):
-        train_loss, train_acc = train_one_epoch(model, train_loader, optimizer, criterion, scaler, device, use_amp)
-        val_loss, val_acc = validate(model, val_loader, criterion, device, use_amp)
-        scheduler.step()
-
-        history['train_loss'].append(train_loss)
-        history['train_acc'].append(train_acc)
-        history['val_loss'].append(val_loss)
-        history['val_acc'].append(val_acc)
-
-        print(f"Epoch {epoch}: Train Acc={train_acc:.2f}%, Val Acc={val_acc:.2f}%")
-
-        if val_acc > best_acc:
-            best_acc = val_acc
-            torch.save({'epoch': epoch, 'model_state_dict': model.state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict(), 'best_acc': best_acc},
-                       f"{config.CHECKPOINT_DIR}/{save_name}_best.pth")
-
-    plot_training_curves(history, f"{config.RESULT_DIR}/{save_name}_training_curves.png")
-    with open(f"{config.RESULT_DIR}/{save_name}_history.json", 'w') as f:
-        json.dump(history, f, indent=2)
-
-    checkpoint = torch.load(f"{config.CHECKPOINT_DIR}/{save_name}_best.pth")
-    model.load_state_dict(checkpoint['model_state_dict'])
-    features, labels = extract_features(model, val_loader, device)
-    plot_tsne(features, labels, config.CLASS_NAMES, f"{config.RESULT_DIR}/{save_name}_tsne.png")
+    print("\n🚀 训练正式开始！(支持 Ctrl+C 安全紧急中断)")
+    print("="*60)
+    
+    try:
+        for epoch in range(args.epochs):
+            train_loss, train_acc = train_one_epoch(model, train_loader, optimizer, criterion, scaler, device)
+            val_loss, val_acc = validate(model, val_loader, criterion, device)
+            
+            # 步进调度器
+            scheduler.step()
+            current_lr = optimizer.param_groups[0]['lr']
+            
+            print(f"Epoch {epoch}/{args.epochs} | LR: {current_lr:.2e} | Train Acc: {(train_acc*100):.2f}% | Val Acc: {(val_acc*100):.2f}%")
+            
+            if val_acc > best_acc:
+                best_acc = val_acc
+                best_path = os.path.join(CHECKPOINT_DIR, f"{save_name}_best.pth")
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'val_acc': val_acc
+                }, best_path)
+                print(f"🌟 [新突破] 最优模型已更新并保存至: {best_path}")
+                
+    except KeyboardInterrupt:
+        print("\n\n⚠️ 收到中止指令 (Ctrl + C)！正在紧急打包当前模型...")
+        interrupt_path = os.path.join(CHECKPOINT_DIR, f"{save_name}_interrupted.pth")
+        torch.save({
+            'epoch': epoch if 'epoch' in locals() else 0,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'val_acc': val_acc if 'val_acc' in locals() else 0.0
+        }, interrupt_path)
+        print(f"✅ [紧急保存成功] 您的模型心血已安全存放在: {interrupt_path}")
+        print("您可以放心退出。\n")
 
 if __name__ == '__main__':
     main()
