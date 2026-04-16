@@ -1,4 +1,5 @@
 import os
+import shutil
 import h5py
 import numpy as np
 import scipy.signal
@@ -6,11 +7,11 @@ import cv2
 from tqdm import tqdm
 from multiprocessing import Pool
 
-
 # 【新增】引入你项目里的配置文件
 from config import config
+
 def parse_filename(filepath):
-    import os
+    """使用您原本最严谨的字典映射法提取标签"""
     basename = os.path.basename(filepath).replace('.mat', '')
     t_code = basename.split('_')[0]
     mapping = {
@@ -24,13 +25,26 @@ def parse_filename(filepath):
     }
     return mapping.get(t_code, 0)
 
-# 【修改】直接使用 config 里的绝对路径，再也不会找不到文件了！
+# ==========================================
+# 核心高分辨率物理参数配置
+# ==========================================
 DATA_ROOT = config.DATA_ROOT         
 OUTPUT_DIR = '/root/autodl-tmp/DroneRFa_Images'
-SEGMENT_LENGTH = 100000
-NUM_SEGMENTS = 1500
 
+# 物理时长 10ms，包含 1,000,000 个连续采样点
+SEGMENT_LENGTH = 1000000 
+# 因为每个片段变长了10倍，为了防止读取越界，每个文件的最大片段数相应缩小10倍
+NUM_SEGMENTS = 150 
+
+# ==========================================
+# 自动彻底清除旧的低分辨率数据
+# ==========================================
+if os.path.exists(OUTPUT_DIR):
+    print(f"🧹 正在删除旧的低分辨率源域数据: {OUTPUT_DIR} ...")
+    shutil.rmtree(OUTPUT_DIR)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+print(f"✨ 已创建干净的新源域目录: {OUTPUT_DIR}")
+
 
 def process_file(file_path):
     label = parse_filename(file_path)
@@ -50,21 +64,26 @@ def process_file(file_path):
                     continue # 如果中断了，可以断点续传
                 
                 start_idx = seg_idx * SEGMENT_LENGTH
+                # 严格防止越界：如果剩下的数据不够 1,000,000 点，直接丢弃该文件剩余部分
                 if start_idx + SEGMENT_LENGTH > total_len:
-                    start_idx = total_len - SEGMENT_LENGTH
+                    break 
                     
                 i_data = f['RF0_I'][0, start_idx:start_idx + SEGMENT_LENGTH]
                 q_data = f['RF0_Q'][0, start_idx:start_idx + SEGMENT_LENGTH]
                 signal = i_data + 1j * q_data
                 
-                # 计算 STFT
-                _, _, Zxx = scipy.signal.stft(signal, nperseg=256, noverlap=128)
+                # ==========================================
+                # 【核心升级】：1024 级 STFT 高清分辨率
+                # ==========================================
+                _, _, Zxx = scipy.signal.stft(signal, nperseg=1024, noverlap=512)
                 mag = np.abs(Zxx)
                 mag = np.log1p(mag)
                 mag = (mag - mag.min()) / (mag.max() - mag.min() + 1e-8)
-                mag = cv2.resize(mag, (224, 224)).astype(np.float32)
                 
-                # 存为 8-bit PNG 图像 (极大地节省硬盘并加快读取)
+                # 物理分辨率保存为 1024x1024
+                mag = cv2.resize(mag, (1024, 1024)).astype(np.float32)
+                
+                # 存为 8-bit PNG 图像
                 mag_img = (mag * 255).astype(np.uint8)
                 cv2.imwrite(out_path, mag_img)
     except Exception as e:
@@ -73,7 +92,8 @@ def process_file(file_path):
 if __name__ == '__main__':
     all_files = [os.path.join(DATA_ROOT, f) for f in os.listdir(DATA_ROOT) if f.endswith('.mat')]
     
+    print(f"\n🚀 开始构建高分辨率 (N=1024, T=1024) 时频图数据集...")
     # 开启 16 个进程狂暴转换
     with Pool(processes=16) as pool:
         list(tqdm(pool.imap(process_file, all_files), total=len(all_files), desc="转换STFT图像"))
-    print("全部数据离线转换完成！")
+    print("\n✅ 全部高分辨率源域数据构建完成！您可以开始新一轮的训练了。")

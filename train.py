@@ -9,17 +9,17 @@ from sklearn.metrics import accuracy_score
 import numpy as np
 from tqdm import tqdm
 import torchvision.transforms as T
+import matplotlib.pyplot as plt
+from models.swin_dual import TimeFreqDecoupledSwin
 
-# 引入自动混合精度 (AMP) 提速省显存
+from models.resnet import ResNetBaseline
+from models.alexnet import AlexNetBaseline
+from models.vgg import VGG16Baseline
 from torch.cuda.amp import GradScaler, autocast
 
 from config import config
 from dataset import DroneRFaImageDataset
 from models.swin_dual import TimeFreqDecoupledSwin
-
-# ==========================================
-# 极致性能压榨开关 (PyTorch 黑魔法)
-# ==========================================
 torch.backends.cudnn.benchmark = True
 torch.backends.cudnn.deterministic = False
 
@@ -30,14 +30,25 @@ def train_one_epoch(model, dataloader, optimizer, criterion, scaler, device):
     
     pbar = tqdm(dataloader, desc="Train", leave=False)
     for images, labels in pbar:
-        # non_blocking=True 允许数据搬运和计算异步重叠
         images, labels = images.to(device, non_blocking=True), labels.to(device, non_blocking=True)
         
-        optimizer.zero_grad(set_to_none=True) # 减少显存碎片
+        # 25% 的概率触发 Mixup 数据增强
+        use_mixup = np.random.rand() < 0.25
+        if use_mixup:
+            lam = np.random.beta(0.2, 0.2)
+            rand_index = torch.randperm(images.size()[0]).to(device)
+            target_a = labels
+            target_b = labels[rand_index]
+            images = lam * images + (1 - lam) * images[rand_index]
+            
+        optimizer.zero_grad(set_to_none=True)
         
         with autocast():
             outputs = model(images)
-            loss = criterion(outputs, labels)
+            if use_mixup:
+                loss = lam * criterion(outputs, target_a) + (1 - lam) * criterion(outputs, target_b)
+            else:
+                loss = criterion(outputs, labels)
             
         scaler.scale(loss).backward()
         scaler.step(optimizer)
@@ -45,8 +56,13 @@ def train_one_epoch(model, dataloader, optimizer, criterion, scaler, device):
 
         running_loss += loss.item() * images.size(0)
         _, preds = torch.max(outputs, 1)
+        
+        if use_mixup:
+            all_labels.extend(target_a.cpu().numpy() if lam > 0.5 else target_b.cpu().numpy())
+        else:
+            all_labels.extend(labels.cpu().numpy())
+            
         all_preds.extend(preds.cpu().numpy())
-        all_labels.extend(labels.cpu().numpy())
         
         pbar.set_postfix({'loss': f"{loss.item():.4f}", 'acc': f"{(accuracy_score(all_labels, all_preds)*100):.2f}%"})
 
@@ -80,9 +96,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', type=str, default='swin_dual')
     parser.add_argument('--swin_mode', type=str, default='both')
-    parser.add_argument('--epochs', type=int, default=30) # 【设定】：默认直接跑 30 轮
-    parser.add_argument('--batch_size', type=int, default=512) 
-    parser.add_argument('--lr', type=float, default=3e-4) # 【设定】：配合 Warmup 提高初始峰值学习率
+    parser.add_argument('--epochs', type=int, default=50) 
+    parser.add_argument('--batch_size', type=int, default=256) 
+    parser.add_argument('--lr', type=float, default=1e-4) 
     args = parser.parse_args()
 
     CHECKPOINT_DIR = os.path.abspath(config.CHECKPOINT_DIR if hasattr(config, 'CHECKPOINT_DIR') else './checkpoints')
@@ -92,17 +108,17 @@ def main():
     print(f"Device: {device} | AMP: True | Checkpoint Dir: {CHECKPOINT_DIR}")
 
     # ==========================================
-    # 数据增强：针对 STFT 频谱图的抗过拟合设计
+    # 【核心升级】：适配高分辨率数据的动态下采样
     # ==========================================
     train_transform = T.Compose([
+        T.Resize((224, 224)), # 强制将硬盘上的 1024x1024 浓缩为 Swin 支持的 224x224
         T.ToTensor(),
-        # 防止模型死记硬背跳频信号的绝对时间位置
         T.RandomAffine(degrees=0, translate=(0.05, 0.05)), 
-        # value='random' 填充随机噪声，物理上等效于恶劣信道中的宽带干扰
-        T.RandomErasing(p=0.5, scale=(0.02, 0.1), ratio=(0.3, 3.3), value='random'), 
+        T.RandomErasing(p=0.2, scale=(0.02, 0.1), ratio=(0.3, 3.3), value='random'), 
     ])
     
     val_transform = T.Compose([
+        T.Resize((224, 224)), # 验证集也必须动态缩放
         T.ToTensor()
     ])
 
@@ -110,7 +126,6 @@ def main():
     train_dataset = DroneRFaImageDataset(config.IMAGE_DATA_ROOT, split='train', transform=train_transform)
     val_dataset = DroneRFaImageDataset(config.IMAGE_DATA_ROOT, split='val', transform=val_transform)
 
-    # Dataloader 极致优化参数
     train_loader = DataLoader(
         train_dataset, args.batch_size, shuffle=True, 
         num_workers=16, pin_memory=True, persistent_workers=True, prefetch_factor=4, 
@@ -125,56 +140,61 @@ def main():
     if args.model == 'swin_dual':
         model = TimeFreqDecoupledSwin(num_classes=25, pretrained=True, mode=args.swin_mode)
         save_name = f"{args.model}_{args.swin_mode}"
+    # 👇 添加下面这些 elif 分支
+    elif args.model in ['resnet18', 'resnet50']:
+        model = ResNetBaseline(num_classes=25, backbone=args.model, pretrained=True)
+        save_name = args.model
+    elif args.model == 'vgg16':
+        model = VGG16Baseline(num_classes=25, pretrained=True)
+        save_name = args.model
+    elif args.model == 'alexnet':
+        model = AlexNetBaseline(num_classes=25, pretrained=True)
+        save_name = args.model
+    else:
+        raise ValueError(f"不支持的模型类型: {args.model}")
+
     model = model.to(device)
 
-    # ==========================================
-    # 核武器级优化：PyTorch 2.0 编译加速
-    # ==========================================
     if hasattr(torch, 'compile'):
-        print("🚀 检测到 PyTorch 2.0+，正在启用底层计算图编译加速 (torch.compile)...")
-        # 注意：使用 compile 后，第一个 Epoch 的启动会卡住 1-2 分钟进行编译，耐心等待！
+        print("🚀 检测到 PyTorch 2.0+，正在启用 torch.compile...")
         model = torch.compile(model)
 
-    criterion = nn.CrossEntropyLoss()
+    class_weights = torch.ones(25, dtype=torch.float32).to(device)
+    criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
     
-    # 强化 Weight Decay，从 0.05 提升至 0.1 压制过拟合
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.1) 
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.05) 
     
-    # ==========================================
-    # Transformer 必备的 Warmup 调度器
-    # ==========================================
     warmup_epochs = 5
-    # 前 5 轮从极小学习率缓慢爬升至目标 args.lr
     warmup_scheduler = LinearLR(optimizer, start_factor=0.01, total_iters=warmup_epochs)
-    # 5 轮后接管，进行余弦退火
     cosine_scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs - warmup_epochs, eta_min=1e-6)
-    # 将两者组合
     scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warmup_epochs])
     
     scaler = GradScaler()
     best_acc = 0.0
-    
-    # 早停机制参数
-    patience = 12
+    patience = 15 
     patience_counter = 0
 
-    print("\n🚀 训练正式开始！(支持 Ctrl+C 安全紧急中断)")
-    print("="*60)
-    
+    history = {'train_loss': [], 'val_loss': [], 'train_acc': [], 'val_acc': []}
+
+    print("\n🚀 训练正式开始！")
     try:
         for epoch in range(args.epochs):
             train_loss, train_acc = train_one_epoch(model, train_loader, optimizer, criterion, scaler, device)
             val_loss, val_acc = validate(model, val_loader, criterion, device)
             
-            # 步进调度器
             scheduler.step()
-            current_lr = optimizer.param_groups[0]['lr']
             
+            history['train_loss'].append(train_loss)
+            history['val_loss'].append(val_loss)
+            history['train_acc'].append(train_acc)
+            history['val_acc'].append(val_acc)
+            
+            current_lr = optimizer.param_groups[0]['lr']
             print(f"Epoch {epoch+1}/{args.epochs} | LR: {current_lr:.2e} | Train Acc: {(train_acc*100):.2f}% | Val Acc: {(val_acc*100):.2f}%")
             
             if val_acc > best_acc:
                 best_acc = val_acc
-                patience_counter = 0 # 重置早停计数器
+                patience_counter = 0 
                 best_path = os.path.join(CHECKPOINT_DIR, f"{save_name}_best.pth")
                 torch.save({
                     'epoch': epoch,
@@ -182,15 +202,15 @@ def main():
                     'optimizer_state_dict': optimizer.state_dict(),
                     'val_acc': val_acc
                 }, best_path)
-                print(f"🌟 [新突破] 最优模型已更新并保存至: {best_path}")
+                print(f"🌟 [新突破] 最优模型已更新至: {best_path}")
             else:
                 patience_counter += 1
                 if patience_counter >= patience:
-                    print(f"\n🛑 触发早停！连续 {patience} 轮验证集无提升，训练提前结束。最优验证集精度: {(best_acc*100):.2f}%")
+                    print(f"\n🛑 触发早停！最优验证集精度: {(best_acc*100):.2f}%")
                     break
                 
     except KeyboardInterrupt:
-        print("\n\n⚠️ 收到中止指令 (Ctrl + C)！正在紧急打包当前模型...")
+        print("\n\n⚠️ 收到中止指令，紧急打包模型...")
         interrupt_path = os.path.join(CHECKPOINT_DIR, f"{save_name}_interrupted.pth")
         torch.save({
             'epoch': epoch if 'epoch' in locals() else 0,
@@ -198,8 +218,35 @@ def main():
             'optimizer_state_dict': optimizer.state_dict(),
             'val_acc': val_acc if 'val_acc' in locals() else 0.0
         }, interrupt_path)
-        print(f"✅ [紧急保存成功] 您的模型心血已安全存放在: {interrupt_path}")
         print("您可以放心退出。\n")
+
+    print("\n📊 正在生成训练分析曲线...")
+    epochs_range = range(1, len(history['train_acc']) + 1)
+    
+    plt.figure(figsize=(12, 5))
+    plt.subplot(1, 2, 1)
+    plt.plot(epochs_range, history['train_acc'], label='Train Accuracy', marker='o', markersize=3)
+    plt.plot(epochs_range, history['val_acc'], label='Val Accuracy', marker='o', markersize=3)
+    plt.title('Training and Validation Accuracy')
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy')
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.6)
+    
+    plt.subplot(1, 2, 2)
+    plt.plot(epochs_range, history['train_loss'], label='Train Loss', marker='o', markersize=3)
+    plt.plot(epochs_range, history['val_loss'], label='Val Loss', marker='o', markersize=3)
+    plt.title('Training and Validation Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.6)
+    
+    plt.tight_layout()
+    os.makedirs('./results', exist_ok=True)
+    plot_path = f"./results/{args.model}_{args.swin_mode}_learning_curve.png"
+    plt.savefig(plot_path, dpi=300)
+    plt.close()
 
 if __name__ == '__main__':
     main()

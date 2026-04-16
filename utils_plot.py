@@ -235,35 +235,59 @@ def plot_gradcam(model, image_tensor, target_layer, class_idx=None, save_path=No
     return overlay
 
 
-def plot_model_comparison(results_dict, save_path):
-    """模型性能对比柱状图（准确率、F1、推理时间等）"""
-    models = list(results_dict.keys())
-    metrics = ['accuracy', 'macro_f1', 'weighted_f1']
+def plot_model_comparison(compare_dict, save_path):
+    """
+    绘制多模型性能对比柱状图
+    """
+    models = list(compare_dict.keys())
+    metrics = ['Accuracy', 'Macro F1', 'Weighted F1']
+    
+    # 提取数据
+    accs = [compare_dict[m]['accuracy'] for m in models]
+    macro_f1s = [compare_dict[m]['macro_f1'] for m in models]
+    weighted_f1s = [compare_dict[m]['weighted_f1'] for m in models]
     
     x = np.arange(len(models))
     width = 0.25
     
     fig, ax = plt.subplots(figsize=(10, 6))
-    for i, metric in enumerate(metrics):
-        values = [results_dict[m][metric] for m in models]
-        bars = ax.bar(x + i*width, values, width, label=metric)
-        for bar in bars:
-            height = bar.get_height()
-            ax.annotate(f'{height:.3f}',
-                       xy=(bar.get_x() + bar.get_width()/2, height),
-                       xytext=(0, 3), textcoords="offset points",
-                       ha='center', va='bottom', fontsize=9)
     
-    ax.set_ylabel('Score')
-    ax.set_title('Model Performance Comparison')
-    ax.set_xticks(x + width)
-    ax.set_xticklabels(models)
-    ax.legend()
-    ax.grid(axis='y', alpha=0.3)
+    rects1 = ax.bar(x - width, accs, width, label='Accuracy', color='skyblue')
+    rects2 = ax.bar(x, macro_f1s, width, label='Macro F1', color='lightcoral')
+    rects3 = ax.bar(x + width, weighted_f1s, width, label='Weighted F1', color='lightgreen')
+    
+    ax.set_ylabel('Scores')
+    ax.set_title('Model Performance Comparison', pad=15)
+    ax.set_xticks(x)
+    ax.set_xticklabels(models, rotation=45, ha='right')
+    
+    # ==========================================
+    # 【核心修复 1】：把 Y 轴上限提高到 1.08，给长数字留出“天空”
+    # ==========================================
+    ax.set_ylim(0.8, 1.08) 
+    
+    # ==========================================
+    # 【核心修复 2】：图例依然放在左上角，但去掉了边框，更清爽
+    # ==========================================
+    ax.legend(loc='upper left', frameon=False) 
+    
+    # 自动在柱子上添加数值标签
+    def autolabel(rects):
+        for rect in rects:
+            height = rect.get_height()
+            ax.annotate(f'{height:.4f}',
+                        xy=(rect.get_x() + rect.get_width() / 2, height),
+                        xytext=(0, 4),  # 稍微再把数字往上抬高 4 个像素
+                        textcoords="offset points",
+                        ha='center', va='bottom', fontsize=10, rotation=90)
+            
+    autolabel(rects1)
+    autolabel(rects2)
+    autolabel(rects3)
+    
     plt.tight_layout()
-    plt.savefig(save_path)
+    plt.savefig(save_path, dpi=300)
     plt.close()
-
 
 def plot_radar_chart(metrics_dict, class_names, save_path, top_k=10):
     """雷达图展示模型在各类别上的综合性能"""

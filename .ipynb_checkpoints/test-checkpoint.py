@@ -12,6 +12,7 @@ from tqdm import tqdm
 import numpy as np
 import random
 import json
+import torchvision.transforms as T  # 【修复 1】：引入 transforms
 
 from config import config
 from dataset import DroneRFaImageDataset
@@ -104,9 +105,16 @@ def main():
     device = torch.device(config.DEVICE if torch.cuda.is_available() else 'cpu')
     print(f"Testing on Device: {device}")
 
-    # 加载测试集
+    # ==========================================
+    # 【修复 2】：为测试集添加动态 Resize
+    # ==========================================
+    test_transform = T.Compose([
+        T.Resize((224, 224)),
+        T.ToTensor()
+    ])
+
     print("正在加载测试集图片...")
-    test_dataset = DroneRFaImageDataset(config.IMAGE_DATA_ROOT, split='test')
+    test_dataset = DroneRFaImageDataset(config.IMAGE_DATA_ROOT, split='test', transform=test_transform)
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size,
                              shuffle=False, num_workers=16, pin_memory=True)
 
@@ -141,7 +149,12 @@ def main():
         raise FileNotFoundError(f"找不到权重文件: {args.checkpoint}")
     print(f"Loading checkpoint: {args.checkpoint}")
     checkpoint = torch.load(args.checkpoint, map_location=device)
-    state_dict = checkpoint['model_state_dict']
+    
+    # 兼容是否保存了完整的 dict 还是单独存了 state_dict
+    if 'model_state_dict' in checkpoint:
+        state_dict = checkpoint['model_state_dict']
+    else:
+        state_dict = checkpoint
 
     # 去除 torch.compile 产生的 _orig_mod. 前缀
     uncompiled_state_dict = {}
@@ -179,7 +192,7 @@ def main():
             print("警告：无法自动确定 Grad-CAM 目标层，跳过。")
         if target_layer is not None:
             gradcam_path = os.path.join(config.RESULT_DIR, f"{save_name}_gradcam.png")
-            # 修复：传入模型和原始张量，plot_gradcam 内部会处理 detach
+            # 传入模型和原始张量
             plot_gradcam(model, sample_img.squeeze(0), target_layer, save_path=gradcam_path)
             print(f"Grad-CAM 图已保存至: {gradcam_path}")
 
