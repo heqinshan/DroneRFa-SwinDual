@@ -1,4 +1,5 @@
 import os
+import copy
 import argparse
 import torch
 import torch.nn as nn
@@ -10,7 +11,6 @@ import numpy as np
 from tqdm import tqdm
 import torchvision.transforms as T
 import matplotlib.pyplot as plt
-from models.swin_dual import TimeFreqDecoupledSwin
 
 from models.resnet import ResNetBaseline
 from models.alexnet import AlexNetBaseline
@@ -20,20 +20,37 @@ from torch.cuda.amp import GradScaler, autocast
 from config import config
 from dataset import DroneRFaImageDataset
 from models.swin_dual import TimeFreqDecoupledSwin
+
 torch.backends.cudnn.benchmark = True
 torch.backends.cudnn.deterministic = False
 
-def train_one_epoch(model, dataloader, optimizer, criterion, scaler, device):
+class ModelEMA:
+    def __init__(self, model, decay=0.999):
+        self.ema = copy.deepcopy(model)
+        self.ema.eval()
+        self.decay = decay
+        for param in self.ema.parameters():
+            param.requires_grad = False
+
+    def update(self, model):
+        with torch.no_grad():
+            msd = model.state_dict()
+            esd = self.ema.state_dict()
+            for k, v in esd.items():
+                if v.dtype.is_floating_point:
+                    v.mul_(self.decay).add_(msd[k].detach(), alpha=1 - self.decay)
+
+def train_one_epoch(model, ema, dataloader, optimizer, criterion, scaler, device):
     model.train()
     running_loss = 0.0
     all_preds, all_labels = [], []
     
-    pbar = tqdm(dataloader, desc="Train", leave=False)
+    pbar = tqdm(dataloader, desc="Train", leave=False, dynamic_ncols=True)
     for images, labels in pbar:
         images, labels = images.to(device, non_blocking=True), labels.to(device, non_blocking=True)
         
-        # 25% 的概率触发 Mixup 数据增强
-        use_mixup = np.random.rand() < 0.25
+        # 🚀 增强 Mixup 概率到 30%，强行压制过拟合
+        use_mixup = np.random.rand() < 0.30
         if use_mixup:
             lam = np.random.beta(0.2, 0.2)
             rand_index = torch.randperm(images.size()[0]).to(device)
@@ -53,6 +70,9 @@ def train_one_epoch(model, dataloader, optimizer, criterion, scaler, device):
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
+
+        if ema is not None:
+            ema.update(model)
 
         running_loss += loss.item() * images.size(0)
         _, preds = torch.max(outputs, 1)
@@ -76,7 +96,7 @@ def validate(model, dataloader, criterion, device):
     all_preds, all_labels = [], []
     
     with torch.no_grad():
-        for images, labels in tqdm(dataloader, desc="Val", leave=False):
+        for images, labels in tqdm(dataloader, desc="Val (EMA)", leave=False, dynamic_ncols=True):
             images, labels = images.to(device, non_blocking=True), labels.to(device, non_blocking=True)
             
             with autocast(): 
@@ -97,28 +117,27 @@ def main():
     parser.add_argument('--model', type=str, default='swin_dual')
     parser.add_argument('--swin_mode', type=str, default='both')
     parser.add_argument('--epochs', type=int, default=50) 
-    parser.add_argument('--batch_size', type=int, default=256) 
+    parser.add_argument('--batch_size', type=int, default=64) 
     parser.add_argument('--lr', type=float, default=1e-4) 
     args = parser.parse_args()
 
     CHECKPOINT_DIR = os.path.abspath(config.CHECKPOINT_DIR if hasattr(config, 'CHECKPOINT_DIR') else './checkpoints')
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    print(f"Device: {device} | AMP: True | Checkpoint Dir: {CHECKPOINT_DIR}")
 
     # ==========================================
-    # 【核心升级】：适配高分辨率数据的动态下采样
+    # 🚀 极致调优：微小面积擦除 (Micro-Erasing)
+    # 面积设为 0.5% - 2%，仅仅制造微小噪点，绝不吞噬跳频线
     # ==========================================
     train_transform = T.Compose([
-        T.Resize((224, 224)), # 强制将硬盘上的 1024x1024 浓缩为 Swin 支持的 224x224
+        T.Resize((224, 224)), 
         T.ToTensor(),
         T.RandomAffine(degrees=0, translate=(0.05, 0.05)), 
-        T.RandomErasing(p=0.2, scale=(0.02, 0.1), ratio=(0.3, 3.3), value='random'), 
+        T.RandomErasing(p=0.2, scale=(0.005, 0.02), ratio=(0.3, 3.3), value=0), 
     ])
     
     val_transform = T.Compose([
-        T.Resize((224, 224)), # 验证集也必须动态缩放
+        T.Resize((224, 224)), 
         T.ToTensor()
     ])
 
@@ -140,25 +159,18 @@ def main():
     if args.model == 'swin_dual':
         model = TimeFreqDecoupledSwin(num_classes=25, pretrained=True, mode=args.swin_mode)
         save_name = f"{args.model}_{args.swin_mode}"
-    # 👇 添加下面这些 elif 分支
     elif args.model in ['resnet18', 'resnet50']:
         model = ResNetBaseline(num_classes=25, backbone=args.model, pretrained=True)
-        save_name = args.model
-    elif args.model == 'vgg16':
-        model = VGG16Baseline(num_classes=25, pretrained=True)
-        save_name = args.model
-    elif args.model == 'alexnet':
-        model = AlexNetBaseline(num_classes=25, pretrained=True)
         save_name = args.model
     else:
         raise ValueError(f"不支持的模型类型: {args.model}")
 
     model = model.to(device)
 
-    if hasattr(torch, 'compile'):
-        print("🚀 检测到 PyTorch 2.0+，正在启用 torch.compile...")
-        model = torch.compile(model)
+    # 初始化 EMA 影子模型
+    ema = ModelEMA(model, decay=0.999)
 
+    # 🚀 恢复 Label Smoothing 为 0.1，防止模型过于自信产生过拟合
     class_weights = torch.ones(25, dtype=torch.float32).to(device)
     criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
     
@@ -171,16 +183,18 @@ def main():
     
     scaler = GradScaler()
     best_acc = 0.0
-    patience = 15 
+    # 🚀 增加耐心值至 25，绝不断其后路
+    patience = 25 
     patience_counter = 0
 
     history = {'train_loss': [], 'val_loss': [], 'train_acc': [], 'val_acc': []}
 
-    print("\n🚀 训练正式开始！")
+    print("\n🚀 【冲刺97%】终极满血版训练开始！(重装正则化 + EMA)")
     try:
         for epoch in range(args.epochs):
-            train_loss, train_acc = train_one_epoch(model, train_loader, optimizer, criterion, scaler, device)
-            val_loss, val_acc = validate(model, val_loader, criterion, device)
+            train_loss, train_acc = train_one_epoch(model, ema, train_loader, optimizer, criterion, scaler, device)
+            
+            val_loss, val_acc = validate(ema.ema, val_loader, criterion, device)
             
             scheduler.step()
             
@@ -190,19 +204,20 @@ def main():
             history['val_acc'].append(val_acc)
             
             current_lr = optimizer.param_groups[0]['lr']
-            print(f"Epoch {epoch+1}/{args.epochs} | LR: {current_lr:.2e} | Train Acc: {(train_acc*100):.2f}% | Val Acc: {(val_acc*100):.2f}%")
+            print(f"Epoch {epoch+1}/{args.epochs} | LR: {current_lr:.2e} | Train Acc: {(train_acc*100):.2f}% | Val Acc (EMA): {(val_acc*100):.2f}%")
             
             if val_acc > best_acc:
                 best_acc = val_acc
                 patience_counter = 0 
                 best_path = os.path.join(CHECKPOINT_DIR, f"{save_name}_best.pth")
+                
                 torch.save({
                     'epoch': epoch,
-                    'model_state_dict': model.state_dict(),
+                    'model_state_dict': ema.ema.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
                     'val_acc': val_acc
                 }, best_path)
-                print(f"🌟 [新突破] 最优模型已更新至: {best_path}")
+                print(f"🌟 [终极突破] 最优 EMA 模型已更新: {(best_acc*100):.2f}%")
             else:
                 patience_counter += 1
                 if patience_counter >= patience:
@@ -210,43 +225,9 @@ def main():
                     break
                 
     except KeyboardInterrupt:
-        print("\n\n⚠️ 收到中止指令，紧急打包模型...")
-        interrupt_path = os.path.join(CHECKPOINT_DIR, f"{save_name}_interrupted.pth")
-        torch.save({
-            'epoch': epoch if 'epoch' in locals() else 0,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'val_acc': val_acc if 'val_acc' in locals() else 0.0
-        }, interrupt_path)
-        print("您可以放心退出。\n")
+        print("\n\n⚠️ 收到中止指令...")
 
-    print("\n📊 正在生成训练分析曲线...")
-    epochs_range = range(1, len(history['train_acc']) + 1)
-    
-    plt.figure(figsize=(12, 5))
-    plt.subplot(1, 2, 1)
-    plt.plot(epochs_range, history['train_acc'], label='Train Accuracy', marker='o', markersize=3)
-    plt.plot(epochs_range, history['val_acc'], label='Val Accuracy', marker='o', markersize=3)
-    plt.title('Training and Validation Accuracy')
-    plt.xlabel('Epoch')
-    plt.ylabel('Accuracy')
-    plt.legend()
-    plt.grid(True, linestyle='--', alpha=0.6)
-    
-    plt.subplot(1, 2, 2)
-    plt.plot(epochs_range, history['train_loss'], label='Train Loss', marker='o', markersize=3)
-    plt.plot(epochs_range, history['val_loss'], label='Val Loss', marker='o', markersize=3)
-    plt.title('Training and Validation Loss')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.legend()
-    plt.grid(True, linestyle='--', alpha=0.6)
-    
-    plt.tight_layout()
-    os.makedirs('./results', exist_ok=True)
-    plot_path = f"./results/{args.model}_{args.swin_mode}_learning_curve.png"
-    plt.savefig(plot_path, dpi=300)
-    plt.close()
+    print(f"\n🎉 终极训练结束！最高精度: {(best_acc*100):.2f}%")
 
 if __name__ == '__main__':
     main()
